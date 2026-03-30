@@ -44,6 +44,14 @@ uint8_t min_seventh[7] = {0, 3, 10, 7, 1, 5, 8};
 uint8_t aug[7] = {0, 4, 8, 12, 2, 5, 9};
 uint8_t dim[7] = {0, 3, 6, 12, 2, 5, 9};
 uint8_t full_dim[7] = {0, 3, 6, 9, 2, 5, 12};
+// Scale mode: semitone intervals from the tonic for each of the 7 scale degrees
+const uint8_t major_scale_semitones[7] = {0, 2, 4, 5, 7, 9, 11};
+const uint8_t minor_scale_semitones[7] = {0, 2, 3, 5, 7, 8, 10};
+// Diatonic chord quality per degree: 0=major, 1=minor, 2=diminished
+const uint8_t major_scale_chord_quality[7] = {0, 1, 1, 0, 0, 1, 2};
+const uint8_t minor_scale_chord_quality[7] = {1, 2, 0, 1, 1, 0, 0};
+// Root-position semitone intervals for each triad quality [quality][note]: 0=major, 1=minor, 2=dim
+const uint8_t triad_semitones[3][3] = {{0, 4, 7}, {0, 3, 7}, {0, 3, 6}};
 uint8_t key_signature_selection = 0; // 0=C, 1=G, 2=D, 3=A, 4=E, 5=B, 6=F, 7=Bb, 8=Eb, 9=Ab, 10=Db, 11=Gb
 enum KeySig { // Enums for KeySigs
   KEY_SIG_C, KEY_SIG_G, KEY_SIG_D, KEY_SIG_A, KEY_SIG_E, KEY_SIG_B,
@@ -97,6 +105,16 @@ bool flat_button_modifier= false; //flag to set the modifier to flat instead of 
 bool continuous_chord = false; // wether the chord is held continuously. Controlled by the "hold" button
 bool rythm_mode = false;
 bool barry_harris_mode = false;
+// Scale mode state
+bool scale_mode = false;           // true when locked to a diatonic scale
+bool scale_is_major = true;        // true=major scale, false=minor scale
+uint8_t scale_tonic_offset = 0;    // semitone offset from C of the scale tonic
+uint8_t scale_tonic_line = 0;      // chord-line index of the tonic (stored on long-press gesture)
+bool scale_is_major_pending = true; // scale quality recorded when chord is pressed during hold
+bool scale_chord_pressed_during_hold = false; // true if a chord was pressed while hold was held
+uint8_t scale_degree_inversions[7] = {0, 0, 0, 0, 0, 0, 0}; // voice-leading optimal inversion per degree
+bool scale_degree_down[7] = {false, false, false, false, false, false, false}; // shift chord down an octave
+uint8_t scale_button_pos = 0;      // 0=triad only, 1=+7th (voice 3), 2=+9th (voice 3)
 IntervalTimer note_timer[4]; // timers for delayed chord enveloppe
 bool inhibit_button=false;
 
@@ -294,6 +312,8 @@ uint8_t calculate_note_chord(uint8_t voice, bool slashed, bool sharp);
 void set_chord_voice_frequency(uint8_t i, uint16_t current_note);
 void calculate_ws_array();
 void rythm_tick_function();
+void compute_scale_voicings();
+uint8_t calculate_note_chord_scale(uint8_t voice);
 
 //-->>LED HSV CALCULATION
 // function to calculate led RGB value, thank you SO
@@ -595,7 +615,82 @@ int8_t get_root_button(uint8_t key, uint8_t shift, uint8_t button) {
     }
   }
 
-  return note; //No need to constrain here
+  return note;
+}
+// Pre-compute voice-leading optimal inversions for all 7 scale degrees.
+// For each degree we find the inversion (0/1/2) and an optional one-octave downward shift
+// that minimises the total semitone movement from the root-position I chord.
+void compute_scale_voicings() {
+  const uint8_t *qualities = scale_is_major ? major_scale_chord_quality : minor_scale_chord_quality;
+  const uint8_t *semitones = scale_is_major ? major_scale_semitones : minor_scale_semitones;
+  uint8_t I_quality = qualities[0];
+  int i_notes[4];
+  for (int v = 0; v < 4; v++) {
+    i_notes[v] = (int)scale_tonic_offset + (int)triad_semitones[I_quality][v % 3] + 12 * (v / 3);
+  }
+  for (uint8_t d = 0; d < 7; d++) {
+    uint8_t d_quality = qualities[d];
+    int degree_root = (int)scale_tonic_offset + (int)semitones[d];
+    uint8_t best_inv = 0;
+    bool best_down = false;
+    int min_movement = INT_MAX;
+    for (uint8_t inv = 0; inv < 3; inv++) {
+      for (int shift = 0; shift <= 12; shift += 12) {
+        bool valid = true;
+        int total = 0;
+        for (int v = 0; v < 4; v++) {
+          int note_idx = (v + inv) % 3;
+          int extra_octave = (v + inv) / 3;
+          int note = degree_root - shift + (int)triad_semitones[d_quality][note_idx] + 12 * extra_octave;
+          if (note < 0) { valid = false; break; }
+          total += abs(note - i_notes[v]);
+        }
+        if (valid && total < min_movement) {
+          min_movement = total;
+          best_inv = inv;
+          best_down = (shift == 12);
+        }
+      }
+    }
+    scale_degree_inversions[d] = best_inv;
+    scale_degree_down[d] = best_down;
+  }
+}
+// Calculate note for a chord voice when scale mode is active.
+// Button pos 0 = pure triad (optimal inversion), 1 = replace doubled voice with diatonic 7th,
+// 2 = replace doubled voice with diatonic 9th (2nd).
+uint8_t calculate_note_chord_scale(uint8_t voice) {
+  const uint8_t *qualities = scale_is_major ? major_scale_chord_quality : minor_scale_chord_quality;
+  const uint8_t *semitones = scale_is_major ? major_scale_semitones : minor_scale_semitones;
+  uint8_t quality = qualities[fundamental];
+  int degree_root = (int)scale_tonic_offset + (int)semitones[fundamental];
+  int shift = scale_degree_down[fundamental] ? 12 : 0;
+  uint8_t inv = scale_degree_inversions[fundamental];
+  int octave = chord_shuffling_array[chord_shuffling_selection][voice] / 10;
+  if (voice >= 4) {
+    // Decoration voices (arp/rythm): cycle through triad, ensure non-negative
+    int note = degree_root - shift + (int)triad_semitones[quality][voice % 3] + 12 * octave;
+    while (note < 0) note += 12;
+    return (uint8_t)note;
+  }
+  // Triad note for this voice under the optimal inversion
+  int note_idx = (voice + inv) % 3;
+  int extra_octave = (voice + inv) / 3;
+  int triad_note = degree_root - shift + (int)triad_semitones[quality][note_idx] + 12 * (extra_octave + octave);
+  // Voices 0-2 always play the triad; voice 3 may carry an extension
+  if (scale_button_pos == 0 || voice < 3) {
+    return (uint8_t)triad_note;
+  }
+  // Voice 3: replace the doubled note with diatonic 7th (pos 1) or 9th/2nd (pos 2)
+  int v2_idx = (2 + inv) % 3;
+  int v2_extra = (2 + inv) / 3;
+  int v2 = degree_root - shift + (int)triad_semitones[quality][v2_idx] + 12 * (v2_extra + octave);
+  uint8_t interval = (scale_button_pos == 1)
+    ? (semitones[(fundamental + 6) % 7] - semitones[fundamental] + 12) % 12  // 6 steps up = diatonic 7th
+    : (semitones[(fundamental + 1) % 7] - semitones[fundamental] + 12) % 12; // 1 step up = diatonic 9th (2nd)
+  int ext = degree_root - shift + (int)interval + 12 * octave;
+  while (ext <= v2) ext += 12;
+  return (uint8_t)ext;
 }
 // function to calculate the frequency of individual chord notes
 uint8_t calculate_note_chord(uint8_t voice, bool slashed, bool sharp) {
@@ -895,6 +990,14 @@ void handle_chords_button() {
       button_pushed = true;
       Serial.print("Button pushed: ");
       Serial.println(i);
+      if (hold_button.read_value()) {
+        // Hold button held: record this chord press as the pending scale gesture.
+        // The scale is activated on long-press release in handle_hold_button().
+        scale_chord_pressed_during_hold = true;
+        scale_tonic_line = (i - 1) / 3;
+        // Minor button (position 1 within the line) selects minor scale; all others = major
+        scale_is_major_pending = ((i - 1) % 3 != 1);
+      }
       if (current_line == -1) {
         current_line = (i - 1) / 3;
         if (!continuous_chord) {
@@ -978,7 +1081,9 @@ void detect_slash() {
 void update_chord_notes() {
   if (button_pushed) {
     for (int i = 0; i < 7; i++) {
-      current_chord_notes[i] = calculate_note_chord(i, slash_chord, sharp_active);
+      current_chord_notes[i] = scale_mode
+        ? calculate_note_chord_scale(i)
+        : calculate_note_chord(i, slash_chord, sharp_active);
     }
     Serial.println("Updating frequencies");
     if (!rythm_mode && !trigger_chord && !retrigger_chord) {
@@ -1068,14 +1173,9 @@ void handle_continuous_mode() {
 void handle_hold_button() {
   uint8_t hold_transition = hold_button.read_transition();
   if (hold_transition == 2) {
-    if (!rythm_mode) {
-      Serial.println("Switching mode");
-      continuous_chord = !continuous_chord;
-      analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
-      if (current_line == -1) {
-        trigger_chord = true;
-      }
-    } else {
+    // Reset gesture flag and handle tap-tempo in rythm mode
+    scale_chord_pressed_during_hold = false;
+    if (rythm_mode) {
       if (since_last_button_push > 100 && since_last_button_push < 2000) {
         rythm_bpm = (rythm_bpm * 5.0 + 60 * 1000 / since_last_button_push) / 6.0;
         Serial.print("Updating the BPM to: ");
@@ -1085,23 +1185,58 @@ void handle_hold_button() {
       }
     }
     since_last_button_push = 0;
-  } else if (hold_transition == 1 && since_last_button_push > 800) {
-    Serial.println("Long push, switching rhythm mode");
-    rythm_mode = !rythm_mode;
-    continuous_chord = false;
-    analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
-    if (rythm_mode) {
-      rythm_current_step = 0;
-      Serial.println("Starting rhythm timers");
-      rythm_timer.priority(254);
-      rythm_timer.begin(rythm_tick_function, short_timer_period);
-      rythm_timer_running = true;
-      rythm_timer.update(long_timer_period);
-      current_long_period = true;
-    } else {
-      Serial.println("Stopping rhythm timers");
-      rythm_timer.end();
-      rythm_timer_running = false;
+  } else if (hold_transition == 1) {
+    if (since_last_button_push > 800) {
+      // Long press: activate/update scale mode if a chord was pressed, exit scale mode,
+      // or toggle rythm mode (arp) in that priority order.
+      if (scale_chord_pressed_during_hold) {
+        Serial.println("Scale mode activated");
+        scale_tonic_offset = get_root_button(key_signature_selection, chord_frame_shift, scale_tonic_line);
+        scale_is_major = scale_is_major_pending;
+        scale_mode = true;
+        compute_scale_voicings();
+        current_line = scale_tonic_line;
+        if (!continuous_chord) {
+          trigger_chord = true;
+        }
+        // Brief LED flash to confirm scale mode entry
+        analogWrite(RYTHM_LED_PIN, 255);
+        delay(40);
+        analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
+      } else if (scale_mode) {
+        Serial.println("Exiting scale mode");
+        scale_mode = false;
+        // Brief LED flash to confirm scale mode exit
+        analogWrite(RYTHM_LED_PIN, 255);
+        delay(40);
+        analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
+      } else {
+        Serial.println("Long push, switching rhythm mode");
+        rythm_mode = !rythm_mode;
+        continuous_chord = false;
+        analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
+        if (rythm_mode) {
+          rythm_current_step = 0;
+          Serial.println("Starting rhythm timers");
+          rythm_timer.priority(254);
+          rythm_timer.begin(rythm_tick_function, short_timer_period);
+          rythm_timer_running = true;
+          rythm_timer.update(long_timer_period);
+          current_long_period = true;
+        } else {
+          Serial.println("Stopping rhythm timers");
+          rythm_timer.end();
+          rythm_timer_running = false;
+        }
+      }
+    } else if (!rythm_mode) {
+      // Short press: toggle continuous chord (hold on/off) – unchanged behaviour
+      Serial.println("Switching mode");
+      continuous_chord = !continuous_chord;
+      analogWrite(RYTHM_LED_PIN, 255 * continuous_chord);
+      if (current_line == -1) {
+        trigger_chord = true;
+      }
     }
   }
 }
@@ -1208,6 +1343,17 @@ void loop() {
     bool button_min = chord_matrix_array[2 + current_line * 3].read_value();
     bool button_seventh = chord_matrix_array[3 + current_line * 3].read_value();
     handle_chord_type(button_maj, button_min, button_seventh);
+    if (scale_mode && current_line >= 0) {
+      // Override current_chord with the scale degree's diatonic quality (used by harp notes)
+      uint8_t quality = scale_is_major
+        ? major_scale_chord_quality[fundamental]
+        : minor_scale_chord_quality[fundamental];
+      if (quality == 0) current_chord = barry_harris_mode ? &maj_sixth : &major;
+      else if (quality == 1) current_chord = barry_harris_mode ? &min_sixth : &minor;
+      else current_chord = barry_harris_mode ? &full_dim : &dim;
+      // Determine which extension to add: first row = triad, second = +7th, third = +9th
+      scale_button_pos = button_seventh ? 2 : (button_min ? 1 : 0);
+    }
     update_chord_notes(); // Replaced updateNotes() with update_chord_notes()
     update_harp_notes();  // Added call to update_harp_notes()
     trigger_chord_notes();
