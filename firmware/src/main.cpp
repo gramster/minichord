@@ -280,7 +280,13 @@ uint8_t harp_port=1;
 uint8_t harp_channel=1;
 uint8_t harp_attack_velocity=127; 
 uint8_t harp_release_velocity=20;
-uint8_t harp_started_notes[12]={0,0,0,0,0,0,0,0,0,0,0,0};    
+uint8_t harp_started_notes[12]={0,0,0,0,0,0,0,0,0,0,0,0};
+uint8_t base_chord_port=2;      // always sends the full chord (no arpeggio)
+uint8_t base_chord_channel=1;
+uint8_t base_chord_started_notes[4]={0,0,0,0};
+uint8_t bass_port=3;            // sends root note one octave down
+uint8_t bass_channel=1;
+uint8_t bass_started_note=0;
 uint8_t midi_base_note=48; // for C3
 uint8_t midi_base_note_transposed=midi_base_note; //to handle note transposition
 uint midi_buffer_delay=100; //in microseconds, helps compatibility with some hardware devices 
@@ -294,6 +300,8 @@ uint8_t calculate_note_chord(uint8_t voice, bool slashed, bool sharp);
 void set_chord_voice_frequency(uint8_t i, uint16_t current_note);
 void calculate_ws_array();
 void rythm_tick_function();
+void send_base_chord_notes();
+void send_bass_note();
 
 //-->>LED HSV CALCULATION
 // function to calculate led RGB value, thank you SO
@@ -487,6 +495,34 @@ void play_note_selected_duration(int i,int current_note){
 void turn_off_led(IntervalTimer *timer) {
   timer->end();
   analogWrite(RYTHM_LED_PIN, 0);
+}
+
+// Send all 4 chord notes simultaneously on the base chord channel (no arpeggiation)
+void send_base_chord_notes() {
+  for (int i = 0; i < 4; i++) {
+    if (base_chord_started_notes[i] != 0) {
+      usbMIDI.sendNoteOff(base_chord_started_notes[i], chord_release_velocity, base_chord_channel, base_chord_port);
+      delayMicroseconds(midi_buffer_delay);
+    }
+    usbMIDI.sendNoteOn(midi_base_note_transposed + current_chord_notes[i], chord_attack_velocity, base_chord_channel, base_chord_port);
+    delayMicroseconds(midi_buffer_delay);
+    base_chord_started_notes[i] = midi_base_note_transposed + current_chord_notes[i];
+  }
+}
+
+// Send root note one octave down on the bass channel
+void send_bass_note() {
+  if (bass_started_note != 0) {
+    usbMIDI.sendNoteOff(bass_started_note, chord_release_velocity, bass_channel, bass_port);
+    delayMicroseconds(midi_buffer_delay);
+    bass_started_note = 0;
+  }
+  int root_note = (int)midi_base_note_transposed + (int)current_chord_notes[0] - 12;
+  if (root_note >= 0) {
+    bass_started_note = (uint8_t)root_note;
+    usbMIDI.sendNoteOn(bass_started_note, chord_attack_velocity, bass_channel, bass_port);
+    delayMicroseconds(midi_buffer_delay);
+  }
 }
 
 //-->>AUDIO HELPER FUNCTIONS
@@ -763,6 +799,16 @@ void load_config(int bank_number) {
     chord_envelope_array[i]->noteOff();
     chord_envelope_filter_array[i]->noteOff();
   }
+  for (int i = 0; i < 4; i++) {
+    if (base_chord_started_notes[i] != 0) {
+      usbMIDI.sendNoteOff(base_chord_started_notes[i], chord_release_velocity, base_chord_channel, base_chord_port);
+      base_chord_started_notes[i] = 0;
+    }
+  }
+  if (bass_started_note != 0) {
+    usbMIDI.sendNoteOff(bass_started_note, chord_release_velocity, bass_channel, bass_port);
+    bass_started_note = 0;
+  }
   trigger_chord = true; //to be ready to retrigger if needed
 
   File entry = myfs.open(bank_name[bank_number]);
@@ -981,6 +1027,8 @@ void update_chord_notes() {
       current_chord_notes[i] = calculate_note_chord(i, slash_chord, sharp_active);
     }
     Serial.println("Updating frequencies");
+    send_base_chord_notes();
+    send_bass_note();
     if (!rythm_mode && !trigger_chord && !retrigger_chord) {
       for (int i = 0; i < 4; i++) {
         set_chord_voice_frequency(i, current_chord_notes[i]);
@@ -1027,6 +1075,18 @@ void stop_chord_notes() {
     }
   }
   AudioInterrupts();
+  for (int i = 0; i < 4; i++) {
+    if (base_chord_started_notes[i] != 0) {
+      usbMIDI.sendNoteOff(base_chord_started_notes[i], chord_release_velocity, base_chord_channel, base_chord_port);
+      delayMicroseconds(midi_buffer_delay);
+      base_chord_started_notes[i] = 0;
+    }
+  }
+  if (bass_started_note != 0) {
+    usbMIDI.sendNoteOff(bass_started_note, chord_release_velocity, bass_channel, bass_port);
+    delayMicroseconds(midi_buffer_delay);
+    bass_started_note = 0;
+  }
 }
 
 void handle_rhythm_mode() {
